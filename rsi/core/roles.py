@@ -39,7 +39,8 @@ async def audit(llm: LLMClient, task: str, conclusion: str,
                                   conclusion=conclusion[:300],
                                   segments=format_segments(segments))
     data = await llm.chat_json(system, user)
-    data.setdefault("verdict", "clean")
+    if data.get("verdict") not in ("clean", "suspect"):
+        data["verdict"] = "unreviewed"
     data.setdefault("first_bad_step", None)
     data.setdefault("error_type", None)
     return data

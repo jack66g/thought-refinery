@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 from ..core.pipeline import new_event
@@ -80,5 +81,15 @@ def normalize(source: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not str(thinking).strip() and not transcript:
         raise ValueError("找不到思考轨迹且无对话轮（reasoning/thinking/<think>/messages 均为空）")
     kind = "host_chat" if source in ("zcode",) and has_conv else "host_task"
-    return new_event(source, task, thinking, conclusion, event_kind=kind,
-                     transcript=transcript, context={"host": source})
+    extra = {"transcript": transcript, "context": {"host": source}}
+    for source_key, event_key in (("event_id", "source_event_id"), ("session_id", "session_id")):
+        if isinstance(payload.get(source_key), str) and payload[source_key].strip():
+            extra[event_key] = payload[source_key].strip()
+    captured = payload.get("captured_at") or payload.get("occurred_at")
+    if captured is not None:
+        try:
+            captured = datetime.fromisoformat(captured.replace("Z", "+00:00")).isoformat()
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("captured_at 必须是 ISO 8601 时间") from exc
+        extra["occurred_at"] = captured
+    return new_event(source, task, thinking, conclusion, event_kind=kind, **extra)

@@ -1,11 +1,16 @@
 """沉淀器：写三条产品线 jsonl（追加、线程安全）+ 质检元数据。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
+from collections import defaultdict, deque
+from datetime import datetime
 import time
 from pathlib import Path
 from typing import Any
+
+from .cleaner import redact
 
 _lock = threading.Lock()
 
@@ -14,19 +19,41 @@ def _append(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(redact(record), ensure_ascii=False) + "\n")
 
 
 class Formatter:
     def __init__(self, dataset_dir: Path):
         self.dataset_dir = dataset_dir
+        self._written: dict[Path, set[str]] = {}
 
     def _path(self, category: str, line: str) -> Path:
         return self.dataset_dir / category / f"{line}.jsonl"
 
+    @staticmethod
+    def _id(prefix: str, content: Any, meta: dict[str, Any]) -> str:
+        event_id = meta.get("event_id")
+        if not event_id:
+            return f"{prefix}-{time.time_ns()}"
+        material = json.dumps([event_id, content], ensure_ascii=False).encode()
+        return f"{prefix}-{hashlib.sha256(material).hexdigest()[:24]}"
+
+    def _persist(self, path: Path, row: dict[str, Any]) -> None:
+        if path not in self._written:
+            self._written[path] = {entry["id"] for entry in _rows(path) if "id" in entry}
+        if row["id"] not in self._written[path]:
+            _append(path, row)
+            self._written[path].add(row["id"])
+
+    def find_sft(self, category: str, event_id: str) -> dict[str, Any] | None:
+        for row in _rows(self._path(category, "sft")):
+            if row.get("meta", {}).get("event_id") == event_id:
+                return row
+        return None
+
     def write_sft(self, category: str, task: str, thinking: str, conclusion: str,
                   meta: dict[str, Any]) -> str:
-        doc_id = f"{category}-{int(time.time()*1000)}-{meta.get('event_id', 'x')[:8]}"
+        doc_id = self._id(category, "sft", meta)
         assistant = f"<think>\n{thinking}\n</think>\n\n{conclusion}"
         record = {
             "id": doc_id,
@@ -36,13 +63,13 @@ class Formatter:
             ],
             "meta": meta,
         }
-        _append(self._path(category, "sft"), record)
+        self._persist(self._path(category, "sft"), record)
         return doc_id
 
     def write_lema(self, category: str, task: str, flawed_thinking: str,
                    error_step_desc: str, corrected_thinking: str,
                    conclusion: str, meta: dict[str, Any]) -> str:
-        doc_id = f"{category}-lema-{int(time.time()*1000)}"
+        doc_id = self._id(f"{category}-lema", "lema", meta)
         record = {
             "id": doc_id,
             "messages": [
@@ -56,13 +83,13 @@ class Formatter:
             ],
             "meta": meta,
         }
-        _append(self._path(category, "lema"), record)
+        self._persist(self._path(category, "lema"), record)
         return doc_id
 
     def write_dpo_negative(self, category: str, task: str, rejected_thinking: str,
                            reject_reason: str, meta: dict[str, Any]) -> str:
         """负样本池：chosen 由同题通过样本事后配对（无配对则不用于训练，仅档案）。"""
-        doc_id = f"{category}-dpo-{int(time.time()*1000)}"
+        doc_id = self._id(f"{category}-dpo", "dpo", meta)
         record = {
             "id": doc_id,
             "prompt": task,
@@ -70,7 +97,7 @@ class Formatter:
             "rejected": f"<think>\n{rejected_thinking}\n</think>",
             "meta": {**meta, "reject_reason": reject_reason, "paired": False},
         }
-        _append(self._path(category, "dpo"), record)
+        self._persist(self._path(category, "dpo"), record)
         return doc_id
 
     def try_pair_dpo(self, category: str, task: str, chosen_text: str) -> int:
@@ -88,14 +115,17 @@ class Formatter:
                 except json.JSONDecodeError:
                     out_lines.append(line)
                     continue
-                if (not rec.get("paired") and rec.get("chosen") is None
+                if (not rec.get("meta", {}).get("paired") and rec.get("chosen") is None
                         and rec["prompt"] == task):
                     rec["chosen"] = chosen_text
                     rec["meta"]["paired"] = True
+                    rec["meta"]["chosen_quality_version"] = 2
                     changed += 1
                 out_lines.append(json.dumps(rec, ensure_ascii=False))
             if changed:
-                path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+                tmp.replace(path)
         return changed
 
     def write_meta_report(self, stats: dict[str, Any]) -> None:
@@ -108,15 +138,15 @@ class Formatter:
 
     def write_pretrain(self, kind: str, text: str, meta: dict[str, Any]) -> str:
         """kind ∈ transcripts | narratives | rewrites。预训练语料行：纯文本 + meta。"""
-        doc_id = f"pt-{kind}-{int(time.time()*1000)}-{meta.get('event_id','x')[:6]}"
-        _append(self.dataset_dir / "pretrain" / f"{kind}.jsonl",
+        doc_id = self._id(f"pt-{kind}", text, meta)
+        self._persist(self.dataset_dir / "pretrain" / f"{kind}.jsonl",
                 {"id": doc_id, "text": text, "meta": meta})
         return doc_id
 
     def write_style(self, messages: list[dict[str, str]], meta: dict[str, Any]) -> str:
         """风格SFT：assistant=用户原话（模型学做用户）。"""
-        doc_id = f"style-{int(time.time()*1000)}-{meta.get('event_id','x')[:6]}"
-        _append(self.dataset_dir / "style" / "sft.jsonl",
+        doc_id = self._id("style", messages, meta)
+        self._persist(self.dataset_dir / "style" / "sft.jsonl",
                 {"id": doc_id, "messages": messages, "meta": meta})
         return doc_id
 
@@ -132,49 +162,84 @@ PRETRAIN_RECIPE = {
 }
 
 
+PRETRAIN_KINDS = ("transcripts", "narratives", "rewrites")
+MOODS = ("positive", "negative", "neutral")
+
+
+def _rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def _mood(row: dict[str, Any]) -> str:
+    value = row.get("meta", {}).get("mood")
+    return value if value in MOODS else "neutral"
+
+
+def _week(row: dict[str, Any]) -> str:
+    meta = row.get("meta", {})
+    raw = meta.get("captured_at") or meta.get("ts")
+    try:
+        year, week, _ = datetime.fromisoformat(raw).isocalendar()
+        return f"{year:04}-W{week:02}"
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+def _balanced(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, deque]] = {mood: defaultdict(deque) for mood in MOODS}
+    for row in sorted(rows, key=lambda r: str(r.get("id", ""))):
+        groups[_mood(row)][_week(row)].append(row)
+    limits = {mood: min(max(0, cap), sum(map(len, weeks.values()))) for mood, weeks in groups.items()}
+    total = sum(limits.values())
+    if sum(value > 0 for value in limits.values()) >= 2:
+        limits = {mood: min(count, total - count) for mood, count in limits.items()}
+    chosen = []
+    for mood in MOODS:
+        weeks = deque(groups[mood][week] for week in sorted(groups[mood]))
+        for _ in range(limits[mood]):
+            batch = weeks.popleft()
+            chosen.append(batch.popleft())
+            if batch:
+                weeks.append(batch)
+    return chosen
+
+
 def build_pretrain_manifest(dataset_dir: Path) -> dict[str, Any]:
-    """汇总预训练三线清单 + 情绪分桶分布 + 训练配方（拿走即训的说明书）。"""
-    manifest: dict[str, Any] = {"lines": {}, "mood_buckets": {}, "recipe": PRETRAIN_RECIPE}
-    total = 0
-    for kind in ("transcripts", "narratives", "rewrites"):
-        path = dataset_dir / "pretrain" / f"{kind}.jsonl"
-        rows = []
-        if path.exists():
-            rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
-        manifest["lines"][kind] = {"count": len(rows),
-                                   "chars": sum(len(r.get("text", "")) for r in rows),
-                                   "subjective_fact": sum(1 for r in rows
-                                                          if r.get("meta", {}).get("subjective_fact"))}
-        total += len(rows)
-        for r in rows:
-            bucket = r.get("meta", {}).get("mood", "neutral")
-            manifest["mood_buckets"][bucket] = manifest["mood_buckets"].get(bucket, 0) + 1
-    style_path = dataset_dir / "style" / "sft.jsonl"
-    style_rows = []
-    if style_path.exists():
-        style_rows = [json.loads(x) for x in style_path.read_text(encoding="utf-8").splitlines() if x.strip()]
-    manifest["lines"]["style_sft"] = {"count": len(style_rows)}
-    manifest["total_pretrain"] = total
-    manifest["balance_note"] = ("情绪时间平衡：训练集组装时按 mood_buckets 配额抽样，"
-                                "任一桶占比不应超过 50%（防低落期底色污染）")
+    manifest: dict[str, Any] = {"lines": {}, "mood_buckets": {}, "capture_weeks": {}, "recipe": PRETRAIN_RECIPE}
+    all_rows = []
+    for kind in PRETRAIN_KINDS:
+        rows = _rows(dataset_dir / "pretrain" / f"{kind}.jsonl")
+        manifest["lines"][kind] = {
+            "count": len(rows), "chars": sum(len(row.get("text", "")) for row in rows),
+            "subjective_fact": sum(bool(row.get("meta", {}).get("subjective_fact")) for row in rows)}
+        all_rows.extend(rows)
+    for row in all_rows:
+        for field, key in (("mood_buckets", _mood(row)), ("capture_weeks", _week(row))):
+            counts = manifest[field]
+            counts[key] = counts.get(key, 0) + 1
+    manifest["lines"]["style_sft"] = {"count": len(_rows(dataset_dir / "style" / "sft.jsonl"))}
+    manifest["total_pretrain"] = len(all_rows)
+    sampled = _balanced(all_rows, 100)
+    buckets = {mood: sum(_mood(row) == mood for row in sampled) for mood in MOODS}
+    manifest["balanced_preview"] = {
+        "per_bucket_cap": 100, "mood_buckets": buckets,
+        "mood_cap_met": bool(sampled) and max(buckets.values()) * 2 <= len(sampled),
+        "missing_buckets": [mood for mood, count in buckets.items() if not count],
+        "capture_weeks": sorted({_week(row) for row in sampled}),
+    }
     path = dataset_dir / "_meta" / "pretrain_manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
     return manifest
 
 
 def sample_balanced(dataset_dir: Path, per_bucket_cap: int = 100) -> list[dict[str, Any]]:
-    """按情绪桶配额抽样，返回平衡后的预训练行（正负中三桶各 ≤ cap）。"""
-    rows: list[dict[str, Any]] = []
-    for kind in ("transcripts", "narratives", "rewrites"):
-        path = dataset_dir / "pretrain" / f"{kind}.jsonl"
-        if path.exists():
-            rows.extend(json.loads(x) for x in
-                        path.read_text(encoding="utf-8").splitlines() if x.strip())
-    by_bucket: dict[str, list[dict[str, Any]]] = {"positive": [], "negative": [], "neutral": []}
-    for r in rows:
-        by_bucket[r.get("meta", {}).get("mood", "neutral")].append(r)
-    out: list[dict[str, Any]] = []
-    for bucket, items in by_bucket.items():
-        out.extend(items[:per_bucket_cap])
-    return out
+    """确定性跨周采样。两桶以上可用时，每桶至多占一半。"""
+    rows = [row for kind in PRETRAIN_KINDS
+            for row in _rows(dataset_dir / "pretrain" / f"{kind}.jsonl")]
+    return _balanced(rows, per_bucket_cap)

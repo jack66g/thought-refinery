@@ -22,7 +22,7 @@ NEED_KEYS = ["energy", "stress", "curiosity", "social", "autonomy", "competence"
 EMOTIONS = ("喜", "怒", "哀", "惧", "厌", "惊")
 
 _K_SHRINK = 50          # 特质收缩系数
-_TRAIT_MAX_STEP = 1.0   # 单事件特质最大移动（T 分）
+_TRAIT_MAX_STEP = 0.1   # 单事件特质最大移动（T 分）
 _MOOD_ALPHA = 0.2       # 心境 EMA
 _MOOD_HALFLIFE_H = 24.0
 _EMOTION_DECAY_PER_MIN = 0.95
@@ -49,6 +49,7 @@ class BioData:
     need_baseline: dict[str, float] = field(default_factory=lambda: {k: 60.0 for k in NEED_KEYS})
     updates: int = 0
     since_baseline: int = 0
+    applied_events: dict[str, str | dict[str, Any]] = field(default_factory=dict)
     _last_t: float = 0.0
 
     # ---------- 时间演化（读取/更新前先调用） ----------
@@ -59,7 +60,9 @@ class BioData:
         if self._last_t <= 0:
             self._last_t = now
             return
-        dt_h = max(0.0, (now - self._last_t) / 3600.0)
+        if now <= self._last_t:
+            return
+        dt_h = (now - self._last_t) / 3600.0
         self._last_t = now
         # 心境：向基线指数回归（半衰期 24h）
         keep = 0.5 ** (dt_h / _MOOD_HALFLIFE_H)
@@ -173,11 +176,13 @@ class BioData:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = self.__dict__.copy()
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        temp.replace(path)
 
-    def append_history(self, path: Path, obs: dict[str, Any]) -> None:
+    def append_history(self, path: Path, obs: dict[str, Any], event_id: str | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "obs": obs,
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event_id": event_id, "obs": obs,
                "state": self.summary()}
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")

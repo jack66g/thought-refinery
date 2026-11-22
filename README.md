@@ -19,7 +19,7 @@
 
 ## 它有什么特别的
 
-1. **答案对 ≠ 过程对**：内置过程审计员，定位"结论对但推理有跳步/碰巧对"的段落——可修则修复后收编，不可修降级为 DPO 负样本，修复对照保留为 LEMA 纠错对。这条红线来自 CoT 忠实性研究（见 `docs/01`）。
+1. **答案对 ≠ 过程对**：内置过程审计员，定位"结论对但推理有跳步/碰巧对"的段落——可修则修复后收编，不可修降级为 DPO 负样本，修复对照保留为 LEMA 纠错对。这条红线来自 CoT 忠实性研究（见 [设计文档](docs/设计文档.md#cot-与-rsi-调研)）。
 2. **四级查重**：精确 hash → 解答骨架等价类（防"题面不同解答模板相同"）→ MinHash+LSH（候选精确复验）→ n-gram 污染，全部纯标准库实现。
 3. **仿生人格状态机**：Big5+H 特质（月级贝叶斯收缩）／PAD 心境（24h 半衰期回归基线）／Ekman-6 情绪（分钟级衰减）／六项稳态需求——全部随对话更新、防漂移三件套（均值回归+硬夹断+基线重估）。画像驱动两件事：**难度自适应出题**（锚+1 档）与**自探索任务生成**（需求缺口→任务类型），两者默认关闭。
 4. **情绪时间平衡采样**：预训练语料按捕获时刻心境分桶，manifest 自带平衡采样函数——防止"状态差的那几周"污染模型底色。
@@ -70,7 +70,16 @@ rsi\start_rsi.bat        # Windows；Linux 手动跑两个 python -m 进程
 ## 测试
 
 ```bash
-python -m pytest rsi/tests -q    # 53 项（含 FakeLLM 全链路 + MCP stdio 冒烟，无需密钥）
+python -m pytest rsi/tests -q    # 66 项，包含 FakeLLM 数据流和 MCP stdio
+```
+
+## 独立运行与数据快照
+
+守护进程可用 `--data-dir` 指定运行数据目录，便于在临时目录内验证新配置及数据质量。冻结导出将 CoT、预训练和风格记录按质量契约与血缘生成快照。
+
+```powershell
+python -m rsi.daemon.main --config rsi/configs/daemon.json --data-dir data/test-rsi
+python -m rsi.core.export --dataset data/test-rsi/dataset --output data/training-snapshot
 ```
 
 ## 目录
@@ -87,7 +96,7 @@ rsi/
 ├── mcp_server.py  MCP 插件本体
 ├── prompts/v0/  12 个种子提示词（判类/价值/审计/修复/净化/出题/解题/元学习/观察者/叙事/改写/探索）
 └── configs/     daemon.json + sme.rsi.json
-docs/            设计文档与调研存档（查重算法规格/仿生系统/底色预训练配方，全部带文献编号）
+docs/            设计文档、台账文档和计划书
 ```
 
 ## 设计依据

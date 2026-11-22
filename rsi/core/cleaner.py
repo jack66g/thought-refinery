@@ -1,8 +1,7 @@
 """廉价体检与清洗：纯规则、零 LLM 成本（阈值来源：调研规格书 v1.0，工程经验值已标注）。
 
 输出 HealthReport（结构化），任何 drop 都带原因——弃单进台账，不静默。
-PII 只对"进入数据集的文本"脱敏，原始轨迹留在 logs（BigScience/FineWeb 口径：
-检测→替换，不删文档）。
+可识别的敏感字段在模型调用、持久化和导出之前替换。
 """
 from __future__ import annotations
 
@@ -44,12 +43,25 @@ def strip_think_tags(text: str) -> str:
 
 
 def mask_pii(text: str) -> str:
-    text = _PATTERNS["api_key"].sub("[密钥已脱敏]", text)
-    text = _PATTERNS["id_card"].sub("[身份证已脱敏]", text)
-    text = _PATTERNS["phone_cn"].sub("[手机号已脱敏]", text)
-    text = _PATTERNS["email"].sub("[邮箱已脱敏]", text)
-    text = _PATTERNS["ipv4"].sub("[IP已脱敏]", text)
+    replacements = {"api_key": "[密钥已脱敏]", "id_card": "[身份证已脱敏]",
+                    "phone_cn": "[手机号已脱敏]", "email": "[邮箱已脱敏]",
+                    "ipv4": "[IP已脱敏]"}
+    for name, replacement in replacements.items():
+        # 全角识别保留原始字符位置，替换之外的措辞和标点不变。
+        for match in reversed(list(_PATTERNS[name].finditer(normalize_width(text)))):
+            text = text[:match.start()] + replacement + text[match.end():]
     return text
+
+
+def redact(value: Any) -> Any:
+    """脱敏 JSON 载荷及动态字典键。"""
+    if isinstance(value, str):
+        return mask_pii(value)
+    if isinstance(value, dict):
+        return {redact(key): redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    return value
 
 
 @dataclass

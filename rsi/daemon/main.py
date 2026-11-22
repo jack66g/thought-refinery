@@ -8,7 +8,7 @@ from pathlib import Path
 
 import uvicorn
 
-from .engine import RSIDaemon
+from .engine import RSI_BASE, RSIDaemon
 from .server import create_app
 
 
@@ -25,9 +25,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent
                                                  / "configs" / "daemon.json"))
+    parser.add_argument("--data-dir", type=Path, default=RSI_BASE,
+                        help="运行数据目录（dataset、logs、biodata）")
     args = parser.parse_args()
     cfg = load_config(Path(args.config))
-    daemon = RSIDaemon(cfg)
+    daemon = RSIDaemon(cfg, args.data_dir.resolve())
     app = create_app(daemon)
     uvicorn.run(app, host=cfg.get("daemon", {}).get("host", "127.0.0.1"),
                 port=int(cfg.get("daemon", {}).get("port", 8100)), log_level="info")

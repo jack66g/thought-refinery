@@ -61,6 +61,8 @@
     "max_missions_per_day": 5
   },
   "budget": {
-    "daily_cost_cap": 5.0
+    "daily_cost_cap": 5.0,
+    "input_usd_per_million": 0.30,
+    "output_usd_per_million": 1.20
   }
 }

@@ -9,16 +9,19 @@
 from __future__ import annotations
 
 import json
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..biodata.state import BioData
+from ..llm.budget import LLMBudgetExceeded
 from ..llm.client import LLMClient
 from ..sme_wrap.client import SMEClient
 from . import roles
-from .cleaner import mask_pii, normalize_width
-from .dedup import DedupConfig, DedupIndex
+from .cleaner import mask_pii, normalize_width, redact
+from .dedup import DedupConfig, DedupIndex, normalize_text
 from .formatter import Formatter, build_pretrain_manifest
 
 
@@ -42,13 +45,14 @@ def build_style_samples(transcript: list[dict[str, str]],
     """风格SFT样本：把对话里的角色对调——用户的话变成 assistant 目标，
     模型由此学会'作为用户那样说话'（WeClone 式）。"""
     samples = []
+    transcript = [turn for turn in transcript if turn.get("role") in ("user", "assistant")]
     for i, turn in enumerate(transcript):
         if turn.get("role") != "user" or i == 0:
             continue
-        target = str(turn.get("content", "")).strip()
+        target = mask_pii(str(turn.get("content", ""))).strip()
         if len(target) < 4:
             continue
-        context = [{"role": _swap_role(t["role"]), "content": str(t.get("content", ""))}
+        context = [{"role": _swap_role(t["role"]), "content": mask_pii(str(t.get("content", "")))}
                    for t in transcript[:i]][-6:]
         if not context:
             continue
@@ -70,7 +74,7 @@ class Splitter:
         # 预训练线宽松去重（jaccard 0.9，防误杀口头禅——调研 B3）
         self.dedup_pt = DedupIndex(
             base_dir=self.dataset_dir / "pretrain",
-            cfg=DedupConfig(jaccard_threshold=0.9, ngram_overlap_threshold=0.8))
+            cfg=DedupConfig(jaccard_threshold=0.9, ngram_overlap_threshold=0.8, global_exact=False))
         self.dedup_style = DedupIndex(
             base_dir=self.dataset_dir / "style",
             cfg=DedupConfig(jaccard_threshold=0.85))
@@ -80,44 +84,66 @@ class Splitter:
     async def process(self, event: dict[str, Any]) -> dict[str, Any]:
         if event.get("event_kind") in ("self_proposed",):
             return {"skipped": "self_event"}
-        out: dict[str, Any] = {"event_id": event["id"], "narratives": 0,
+        event = redact(event)
+        event_id = event["id"]
+        out: dict[str, Any] = {"event_id": event_id, "narratives": 0,
                                "transcripts": 0, "style": 0, "facts": 0}
-        content = event["task"]
         transcript = event.get("transcript") or []
-        if transcript:
-            content += "\n" + "\n".join(f"{t.get('role')}: {t.get('content', '')}"
-                                        for t in transcript[:20])
-        elif event.get("thinking"):
-            content += "\n" + event["thinking"]
+        quotes = [str(turn.get("content", "")) for turn in transcript if turn.get("role") == "user"]
+        if not transcript:
+            quotes = [event["task"]]
+        content = "\n".join(quotes)[:3000]
+        cached = self.biodata.applied_events.get(event_id)
+        observed = (cached["observation"] if isinstance(cached, dict)
+                    else await roles.observe(self.llm, content) if content.strip() else {})
+        returned = observed.get("facts")
+        if not isinstance(returned, list):
+            returned = []
+        facts = list(dict.fromkeys(
+            fact.strip() for fact in returned if isinstance(fact, str)
+            and len(fact.strip()) >= 8 and any(fact.strip() in quote for quote in quotes)
+            and fact.strip() in content))
+        observed["facts"] = facts
 
-        # 1) 观察者：状态 Δ + 事实抽取（一次调用两用）
-        obs = await roles.observe(self.llm, content)
-        self.biodata.apply(obs)
-        self.biodata.save(self.state_path)
-        self.biodata.append_history(self.hist_path, obs)
-        bucket = self.biodata.mood_bucket()
+        captured_at = event.get("occurred_at", "")
+        try:
+            timestamp = min(time.time(), datetime.fromisoformat(captured_at).timestamp())
+        except (TypeError, ValueError, OverflowError, OSError):
+            timestamp = time.time()
+        bucket = cached["mood"] if isinstance(cached, dict) else cached
+        if bucket is None:
+            self.biodata.apply(observed, now=timestamp)
+            bucket = self.biodata.mood_bucket()
+            self.biodata.applied_events[event_id] = {"mood": bucket, "observation": observed}
+            self.biodata.save(self.state_path)
+            self.biodata.append_history(self.hist_path, observed, event_id)
         out["mood_bucket"] = bucket
+        metadata = {"event_id": event_id, "mood": bucket, "captured_at": captured_at,
+                    "session_id": event.get("session_id"), "quality_version": 2,
+                    "ts": time.strftime("%F %T")}
 
-        # 2) 事实 → 双落点：SME 结构化（RAG 用）+ 第一人称叙事（CPT 用）
-        facts = [str(f).strip() for f in (obs.get("facts") or []) if str(f).strip()]
         for fact in facts:
-            await self.sme.add(mask_pii(fact), ns="rsi.facts",
-                               tags=["subjective_fact"], importance=0.7,
-                               metadata={"event_id": event["id"],
-                                         "mood": bucket})
+            await self.sme.add(fact, ns="rsi.facts", tags=["subjective_fact"], importance=0.7,
+                               metadata=metadata)
         out["facts"] = len(facts)
         if facts:
             narr = await roles.narrate(self.llm, facts)
-            for para in narr.get("narratives", []):
-                text = mask_pii(normalize_width(str(para))).strip()
-                if len(text) < 30:
+            supported = [normalize_width(fact) for fact in facts]
+            candidates = narr.get("narratives", [])
+            candidates = candidates if isinstance(candidates, list) else []
+            for para in [*candidates, *facts]:
+                if not isinstance(para, str):
                     continue
-                if self.dedup_pt.check(text, "narratives", event["id"]).verdict != "unique":
+                text = mask_pii(normalize_width(para)).strip()
+                sentences = [s.strip() for s in re.split(r"[。！？!?\n]+", text) if s.strip()]
+                evidence = [fact for fact in supported if any(sentence in fact for sentence in sentences)]
+                if (len(text) < 8 or "我" not in text or not sentences
+                        or not all(any(sentence in fact for fact in evidence) for sentence in sentences)):
+                    continue
+                if self.dedup_pt.check(text, "narratives", event_id).verdict != "unique":
                     continue
                 doc = self.formatter.write_pretrain(
-                    "narratives", text,
-                    {"event_id": event["id"], "subjective_fact": True,
-                     "mood": bucket, "ts": time.strftime("%F %T")})
+                    "narratives", text, {**metadata, "subjective_fact": True, "evidence": evidence})
                 self.dedup_pt.add(text, "narratives", doc)
                 out["narratives"] += 1
 
@@ -128,8 +154,7 @@ class Splitter:
             if self.dedup_pt.check(text, "transcripts", event["id"]).verdict == "unique":
                 doc = self.formatter.write_pretrain(
                     "transcripts", text,
-                    {"event_id": event["id"], "subjective_fact": False,
-                     "mood": bucket, "ts": time.strftime("%F %T")})
+                    {**metadata, "subjective_fact": False})
                 self.dedup_pt.add(text, "transcripts", doc)
                 out["transcripts"] += 1
                 try:
@@ -137,20 +162,20 @@ class Splitter:
                     if len(rewrite) >= 30:
                         rewrite = mask_pii(normalize_width(rewrite))
                         v = self.dedup_pt.check(rewrite, "rewrites", event["id"])
-                        if v.verdict == "unique":
+                        if v.verdict == "unique" and normalize_text(rewrite) != normalize_text(text):
                             rdoc = self.formatter.write_pretrain(
                                 "rewrites", rewrite,
-                                {"event_id": event["id"], "subjective_fact": False,
-                                 "mood": bucket, "rewrite_of": doc,
-                                 "ts": time.strftime("%F %T")})
+                                {**metadata, "subjective_fact": False, "rewrite_of": doc})
                             self.dedup_pt.add(rewrite, "rewrites", rdoc)
                             out["rewrites"] = out.get("rewrites", 0) + 1
-                except Exception as exc:  # noqa: BLE001 改写失败不拖垮其余线，但必须留痕
+                except LLMBudgetExceeded:
+                    raise
+                except (ValueError, RuntimeError) as exc:
                     err_path = self.base / "logs" / "errors.jsonl"
                     err_path.parent.mkdir(parents=True, exist_ok=True)
                     with err_path.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps({"ts": time.strftime("%F %T"),
-                                             "err": f"rewrite:{exc!r}",
+                                             "err": f"rewrite:{type(exc).__name__}",
                                              "event_id": event["id"]},
                                             ensure_ascii=False) + "\n")
 
@@ -161,8 +186,7 @@ class Splitter:
                                       event["id"]).verdict != "unique":
                 continue
             doc = self.formatter.write_style(
-                messages, {"event_id": event["id"], "mood": bucket,
-                           "ts": time.strftime("%F %T")})
+                messages, metadata)
             self.dedup_style.add(fingerprint, "style", doc)
             out["style"] += 1
 
@@ -170,7 +194,7 @@ class Splitter:
         if self.biodata.updates % 10 == 0:
             await self.sme.add(f"画像快照：{self.biodata.persona_card()}",
                                ns="rsi.biodata", tags=["snapshot"],
-                               metadata={"updates": self.biodata.updates})
+                               metadata={"updates": self.biodata.updates, "event_id": event_id})
 
         build_pretrain_manifest(self.dataset_dir)
         return out

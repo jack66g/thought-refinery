@@ -8,17 +8,18 @@ import json
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..llm.client import LLMClient
 from ..sme_wrap.client import SMEClient
 from . import roles
-from .cleaner import clean_for_dataset, health_check, strip_think_tags
+from .cleaner import clean_for_dataset, health_check, looks_truncated, mask_pii, redact, strip_think_tags
 from .dedup import DedupConfig, DedupIndex
 from .formatter import Formatter
-from .segmenter import fcs_truncate, find_conclusion_segment, segment
-from .verifier import extract_answer, hard_verify, math_equal, soft_verify
+from .segmenter import fcs_truncate, segment
+from .verifier import answers_agree, deterministic_answer, extract_answer, hard_verify, soft_verify
 
 # 审计错误类型 → 可修性（设计书 §3.5）
 _REPAIRABLE = {"跳步", "计算错误", "内部矛盾", "表述不严谨"}
@@ -76,7 +77,7 @@ class Pipeline:
                 detail: str = "") -> None:
         rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event_id": event["id"],
                "source": event.get("source", ""), "stage": stage,
-               "outcome": outcome, "detail": detail}
+               "outcome": outcome, "detail": mask_pii(detail)}
         with (self.logs_dir / "funnel.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         if outcome == "drop":
@@ -88,6 +89,12 @@ class Pipeline:
 
     async def process(self, event: dict[str, Any]) -> dict[str, Any]:
         """event: NormalizedEvent（connectors.adapters 产出或 self_propose 构造）。"""
+        event = redact(event)
+        if event.get("replaying"):
+            for category in roles.CATEGORIES:
+                stored = self.formatter.find_sft(category, event["id"])
+                if stored is not None:
+                    return await self._recover_sft(event, category, stored)
         self.stats["events_total"] += 1
         result: dict[str, Any] = {"event_id": event["id"], "outcome": "dropped",
                                   "category": None, "doc_ids": [], "stages": []}
@@ -106,20 +113,11 @@ class Pipeline:
         # 0.5) 结论一致性（规格书 T3：思考尾部答案 vs 结论字段，不一致即丢）
         concl_field = (event.get("conclusion") or "").strip()
         think_answer = extract_answer(strip_think_tags(event["thinking"]))
-        if concl_field and think_answer:
-            both_num = re.fullmatch(r"[-+*/().\d\s]+", concl_field) and \
-                re.fullmatch(r"[-+*/().\d\s]+", think_answer)
-            if both_num and not math_equal(concl_field, think_answer):
-                self._funnel(event, "consistency", "drop",
-                             f"{concl_field}!={think_answer}")
-                self._save_stats()
-                result["drop_reason"] = f"结论不一致:{think_answer}vs{concl_field}"
-                return result
-            if not both_num and concl_field.strip("。，.") != think_answer.strip("。，."):
-                self._funnel(event, "consistency", "drop", "text_mismatch")
-                self._save_stats()
-                result["drop_reason"] = "结论不一致(文本)"
-                return result
+        if concl_field and think_answer and not answers_agree(concl_field, think_answer):
+            self._funnel(event, "consistency", "drop", "answer_mismatch")
+            self._save_stats()
+            result["drop_reason"] = "结论不一致"
+            return result
         result["stages"].append("consistency=ok")
 
         # 1) 判类
@@ -159,103 +157,72 @@ class Pipeline:
                 return result
             result["stages"].append(f"value_gate={vg['total']}")
 
-        # 4) 分段审计
+        # 4) 分段审计和修复后复审
+        task = event["task"]
         thinking = strip_think_tags(event["thinking"])
+        conclusion = concl_field or think_answer
         segments = segment(thinking)
-        audit_res = await roles.audit(self.llm, event["task"],
-                                      event.get("conclusion", ""), segments)
+        audit = await roles.audit(self.llm, task, conclusion, segments)
         lineage = "seed"
-        lema_material = None
-        if audit_res["verdict"] == "suspect":
-            bad = int(audit_res.get("first_bad_step") or 0)
-            error_type = audit_res.get("error_type") or "未知"
-            if bad < 1 or bad > len(segments):
-                bad = 1
-            if error_type in _REPAIRABLE:
-                prev_ctx = segments[bad - 2] if bad >= 2 else "（开头）"
-                next_ctx = segments[bad] if bad < len(segments) else "（结尾）"
-                fixed_seg = await roles.repair(
-                    self.llm, event["task"], prev_ctx, segments[bad - 1],
-                    next_ctx, event.get("conclusion", ""))
-                if fixed_seg == "UNREPAIRABLE":
-                    lema_material = None
-                    self._funnel(event, "repair", "drop", f"unrepairable:{error_type}")
-                    doc = self._write_dpo(event, category, thinking, f"unrepairable:{error_type}")
-                    result["doc_ids"].append(doc)
-                    self.stats["dpo_negatives"] += 1
-                    self.stats["by_category"][category]["dropped"] += 1
-                    self._save_stats()
-                    result["drop_reason"] = f"unrepairable:{error_type}"
-                    return result
-                repaired_segments = (segments[:bad - 1] + [fixed_seg]
-                                     + segments[bad:])
-                repaired_thinking = "\n".join(repaired_segments)
-                re_audit = await roles.audit(self.llm, event["task"],
-                                             event.get("conclusion", ""),
-                                             segment(repaired_thinking))
-                if re_audit["verdict"] == "suspect":
-                    # 修复失败 → LEMA 纠错对（错误+纠正+终对仍可用）
-                    lema_material = {"flawed": "\n".join(segments[:bad]),
-                                     "error_desc": f"第{bad}段 {error_type}",
-                                     "corrected": repaired_thinking}
-                    thinking = repaired_thinking
-                    lineage = "lema"
-                    result["stages"].append(f"repair=failed->lema({error_type})")
-                else:
-                    thinking = repaired_thinking
-                    lineage = "repaired"
-                    result["stages"].append(f"repair=ok({error_type})")
-            else:
-                # 不可修类 → 负样本
-                self._funnel(event, "audit", "drop", f"unrepairable:{error_type}")
-                doc = self._write_dpo(event, category, thinking, error_type)
-                result["doc_ids"].append(doc)
-                self.stats["dpo_negatives"] += 1
-                self.stats["by_category"][category]["dropped"] += 1
-                self._save_stats()
-                result["drop_reason"] = error_type
-                return result
+        flawed = None
+        if audit.get("verdict") != "clean":
+            position = audit.get("first_bad_step")
+            reason = audit.get("error_type")
+            can_repair = (audit.get("verdict") == "suspect" and isinstance(reason, str)
+                          and reason in _REPAIRABLE and type(position) is int
+                          and 1 <= position <= len(segments))
+            if not can_repair:
+                detail = reason if isinstance(reason, str) else "unreviewed"
+                return self._reject(event, result, thinking, "audit", f"unrepairable:{detail}")
+            index = position - 1
+            fixed = strip_think_tags(await roles.repair(
+                self.llm, task, segments[index - 1] if index else "（开头）",
+                segments[index], segments[position] if position < len(segments) else "（结尾）",
+                conclusion))
+            if not fixed or fixed == "UNREPAIRABLE":
+                return self._reject(event, result, thinking, "repair", f"unrepairable:{reason}")
+            repaired = "\n".join([*segments[:index], fixed, *segments[position:]])
+            if (await roles.audit(self.llm, task, conclusion, segment(repaired))).get("verdict") != "clean":
+                return self._reject(event, result, thinking, "repair", f"reaudit_failed:{reason}")
+            flawed = thinking
+            thinking = repaired
+            lineage = "repaired"
+            result["stages"].append(f"repair=ok({reason})")
         else:
+            reason = None
             result["stages"].append("audit=clean")
 
-        # 5) FCS 截断 + 删空转
-        segs2 = fcs_truncate(segment(thinking), keep_reflection=True)
-        final_thinking = remove_dead_waits("\n".join(segs2))
-        result["stages"].append(f"fcs={len(segments)}→{len(segs2)}段")
+        # 5–6) 截断和净化产生候选，只有通过复审的版本才能替换已有审计结果。
+        trimmed = remove_dead_waits("\n".join(fcs_truncate(segment(thinking), keep_reflection=True)))
+        candidate = strip_think_tags(await roles.purify(self.llm, task, trimmed))
+        leaked = any(marker in candidate for marker in (
+            "已审计的思考", "直接输出重写后的完整思考文本", "只输出 JSON", "[ROLE:"))
+        candidate_answer = extract_answer(candidate)
+        purified = thinking
+        if (len(candidate) >= 20 and not leaked and not looks_truncated(candidate)
+                and (not candidate_answer or answers_agree(candidate_answer, conclusion))):
+            if candidate == thinking or (await roles.audit(
+                    self.llm, task, conclusion, segment(candidate))).get("verdict") == "clean":
+                purified = candidate
+        result["stages"].append("purify=ok" if purified == candidate else "purify=fallback_audited")
 
-        # 6) 重述净化
-        purified = await roles.purify(self.llm, event["task"], final_thinking)
-        # 模板回显守卫：真模型也可能把提示词指令抄进输出——发现即退回截断版
-        _LEAK_MARKERS = ("已审计的思考", "直接输出重写后的完整思考文本",
-                         "只输出 JSON", "[ROLE:")
-        if (len(purified) < 20
-                or any(marker in purified for marker in _LEAK_MARKERS)):
-            purified = final_thinking
-            result["stages"].append("purify=fallback_raw")
-        else:
-            result["stages"].append("purify=ok")
-
-        # 7) 终验
-        conclusion = event.get("conclusion", "") or extract_answer(purified) \
-            or extract_answer(thinking)
+        # 7) 答案门。可独立计算的自驱题需要同时通过题面推导和标准答案。
         if is_self and event.get("expected_answer"):
-            verified = await hard_verify(conclusion, event["expected_answer"],
-                                         event.get("answer_type", "math_expression"))
-            verify_kind = "hard"
+            standard = event["expected_answer"]
+            answer_type = event.get("answer_type", "math_expression")
+            verified = await hard_verify(conclusion, standard, answer_type)
+            computed = deterministic_answer(task)
+            if computed is not None:
+                verified = verified and answers_agree(conclusion, computed)
+            verify_kind = "hard" if computed is not None else "hard+independent"
+            if computed is None and verified:
+                verified, _ = await soft_verify(self.llm, task, purified, conclusion, self.cfg.get("verify", {}))
         else:
             verified, agree_ratio = await soft_verify(
-                self.llm, event["task"], purified, conclusion,
-                self.cfg.get("verify", {}))
+                self.llm, task, purified, conclusion, self.cfg.get("verify", {}))
             verify_kind = f"soft({agree_ratio:.0%})"
         if not verified:
-            self._funnel(event, "verify", "drop", verify_kind)
-            doc = self._write_dpo(event, category, purified, f"verify_fail:{verify_kind}")
-            result["doc_ids"].append(doc)
-            self.stats["dpo_negatives"] += 1
-            self.stats["by_category"][category]["dropped"] += 1
-            self._save_stats()
-            result["drop_reason"] = f"verify_fail:{verify_kind}"
-            return result
+            return self._reject(event, result, purified, "verify", f"verify_fail:{verify_kind}")
         result["stages"].append(f"verify={verify_kind}")
 
         # 8) 终查重（净化后文本为权威文本）
@@ -272,7 +239,11 @@ class Pipeline:
         task_c, think_c, concl_c = clean_for_dataset(event["task"], purified, conclusion)
         meta = {"event_id": event["id"], "source": event.get("source", ""),
                 "lineage": lineage, "category_tags": cls.get("tags", []),
-                "verify": verify_kind, "think_chars": len(purified),
+                "quality_version": 2, "captured_at": event.get("occurred_at"),
+                "repair_reason": reason, "repair_position": position if flawed is not None else None,
+                "session_id": event.get("session_id"),
+                "verify": verify_kind, "deterministic_verifier": deterministic_answer(task) is not None,
+                "think_chars": len(purified),
                 "stages": result["stages"]}
         doc_id = self.formatter.write_sft(category, task_c, think_c, concl_c, meta)
         result["doc_ids"].append(doc_id)
@@ -290,42 +261,71 @@ class Pipeline:
         if paired:
             result["stages"].append(f"dpo_paired={paired}")
 
-        if lema_material:
+        if flawed is not None:
             lmeta = {**meta, "lineage": "lema"}
+            _, flawed_clean, _ = clean_for_dataset("", flawed, "")
             ldoc = self.formatter.write_lema(
-                category, task_c, lema_material["flawed"],
-                lema_material["error_desc"], lema_material["corrected"],
-                concl_c, lmeta)
+                category, task_c, flawed_clean, f"第{position}段 {reason}", think_c, concl_c, lmeta)
             result["doc_ids"].append(ldoc)
             self.stats["lema"] += 1
-
-        # 10) SME 索引卡 + 错误模式
-        await self.sme.add(
-            f"{category}类已收录：{task_c[:60]}（{lineage}，{verify_kind}验证通过）",
-            ns=f"cls.{category}",
-            tags=[f"cat.{category}"] + cls.get("tags", [])[:3],
-            metadata={"doc_id": doc_id, "lineage": lineage,
-                      "path": str(self._path_of(category, "sft"))})
-        if audit_res.get("error_type"):
-            await self.sme.add(
-                f"{category}类错误模式：{audit_res['error_type']}（{event['task'][:50]}）",
-                ns="rsi.trace_index",
-                tags=["error_pattern", f"cat.{category}"],
-                metadata={"event_id": event["id"]})
 
         result["outcome"] = "accepted"
         self._funnel(event, "accept", "accept", lineage)
         self._save_stats()
+        await self._publish_index(category, doc_id, task_c, meta)
         return result
+
+    async def _recover_sft(self, event: dict[str, Any], category: str, stored: dict[str, Any]) -> dict[str, Any]:
+        meta = stored["meta"]
+        task = stored["messages"][0]["content"]
+        answer = stored["messages"][-1]["content"]
+        thinking, _, conclusion = answer.removeprefix("<think>").partition("</think>")
+        self.dedup.add(task + "\n" + thinking.strip(), category, stored["id"])
+        self.dedup.add(event["task"] + "\n" + strip_think_tags(event["thinking"]), category,
+                       stored["id"] + "-raw", count_skeleton=False)
+        self.formatter.try_pair_dpo(category, task, answer)
+        documents = [stored["id"]]
+        if meta.get("repair_reason"):
+            _, flawed, _ = clean_for_dataset("", event["thinking"], "")
+            documents.append(self.formatter.write_lema(
+                category, task, flawed, f"第{meta['repair_position']}段 {meta['repair_reason']}",
+                thinking.strip(), conclusion.strip(), {**meta, "lineage": "lema"}))
+        await self._publish_index(category, stored["id"], task, meta)
+        return {"event_id": event["id"], "outcome": "accepted", "category": category,
+                "doc_ids": documents, "stages": meta["stages"]}
+
+    async def _publish_index(self, category: str, doc_id: str, task: str, meta: dict[str, Any]) -> None:
+        lineage, verify = meta["lineage"], meta["verify"]
+        await self.sme.add(
+            f"{category}类已收录：{task[:60]}（{lineage}，{verify}验证通过）",
+            ns=f"cls.{category}", tags=[f"cat.{category}", *meta["category_tags"][:3]],
+            metadata={"doc_id": doc_id, "event_id": meta["event_id"], "lineage": lineage,
+                      "path": str(self._path_of(category, "sft"))})
+        if reason := meta.get("repair_reason"):
+            await self.sme.add(f"{category}类错误模式：{reason}（{task[:50]}）", ns="rsi.trace_index",
+                               tags=["error_pattern", f"cat.{category}"], metadata={"event_id": meta["event_id"]})
 
     def _path_of(self, category: str, line: str) -> Path:
         return self.dataset_dir / category / f"{line}.jsonl"
+
+    def _reject(self, event: dict[str, Any], result: dict[str, Any], thinking: str,
+                stage: str, reason: str) -> dict[str, Any]:
+        category = result["category"]
+        reason = mask_pii(reason)
+        self._funnel(event, stage, "drop", reason)
+        result["doc_ids"].append(self._write_dpo(event, category, thinking, reason))
+        result["drop_reason"] = reason
+        self.stats["dpo_negatives"] += 1
+        self.stats["by_category"][category]["dropped"] += 1
+        self._save_stats()
+        return result
 
     def _write_dpo(self, event: dict[str, Any], category: str, thinking: str,
                    reason: str) -> str:
         task_c, think_c, _ = clean_for_dataset(event["task"], thinking, "")
         return self.formatter.write_dpo_negative(category, task_c, think_c, reason,
-                                                 {"event_id": event["id"],
+                                                 {"event_id": event["id"], "quality_version": 2,
+                                                  "session_id": event.get("session_id"),
                                                   "source": event.get("source", "")})
 
 
@@ -333,4 +333,4 @@ def new_event(source: str, task: str, thinking: str, conclusion: str = "",
               event_kind: str = "host_task", **extra: Any) -> dict[str, Any]:
     return {"id": uuid.uuid4().hex[:12], "source": source, "event_kind": event_kind,
             "task": task, "thinking": thinking, "conclusion": conclusion,
-            "occurred_at": time.strftime("%Y-%m-%d %H:%M:%S"), **extra}
+            "occurred_at": datetime.now().astimezone().isoformat(), **extra}

@@ -6,6 +6,7 @@ rsi_distill 自然回流 CoT 线——闭环。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 from ..biodata.state import BioData
 from ..core import roles
+from ..llm.budget import LLMBudgetExceeded
 from ..llm.client import LLMClient, LLMNotConfigured
 from ..sme_wrap.client import SMEClient
 
@@ -25,6 +27,7 @@ class Explorer:
         self.sme = sme
         self.cfg = cfg.get("self_explore", {})
         self.log_path = rsi_base / "logs" / "explore.jsonl"
+        self._lock = asyncio.Lock()
         self.stats_path = rsi_base / "logs" / "stats.json"
 
     def _today_count(self) -> int:
@@ -52,6 +55,10 @@ class Explorer:
         return "；".join(anchors)
 
     async def next_mission(self) -> dict[str, Any]:
+        async with self._lock:
+            return await self._next_mission()
+
+    async def _next_mission(self) -> dict[str, Any]:
         if not self.cfg.get("enabled", False):
             return {"enabled": False, "message": "自探索默认关闭（self_explore.enabled）"}
         cap = int(self.cfg.get("max_missions_per_day", 5))
@@ -62,7 +69,7 @@ class Explorer:
         try:
             mission = await roles.explore_mission(
                 self.llm, self.biodata.persona_card(), self._anchors())
-        except LLMNotConfigured as exc:
+        except (LLMBudgetExceeded, LLMNotConfigured) as exc:
             return {"enabled": True, "error": str(exc)}
         mission["date"] = time.strftime("%Y-%m-%d")
         mission["ts"] = time.strftime("%F %T")

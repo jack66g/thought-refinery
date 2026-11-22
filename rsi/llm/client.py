@@ -8,9 +8,13 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import httpx
+
+from ..core.cleaner import mask_pii
+from .budget import DailyBudget
 
 
 class LLMNotConfigured(RuntimeError):
@@ -24,7 +28,8 @@ class BaseLLM:
 
 
 class OpenAICompatLLM(BaseLLM):
-    def __init__(self, cfg: dict[str, Any]):
+    def __init__(self, cfg: dict[str, Any], budget: DailyBudget | None = None):
+        self.budget = budget
         self.base_url: str = cfg["base_url"].rstrip("/")
         self.model: str = cfg["model"]
         self.api_key_env: str = cfg.get("api_key_env", "RSI_LLM_API_KEY")
@@ -47,10 +52,14 @@ class OpenAICompatLLM(BaseLLM):
                 {"role": "user", "content": user},
             ],
             "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
+            "max_tokens": self.max_tokens if max_tokens is None else min(self.max_tokens, max_tokens),
         }
         if self.reasoning_effort:
             body["reasoning_effort"] = self.reasoning_effort
+        reservation = None
+        if self.budget is not None:
+            upper_input = len(system.encode("utf-8")) + len(user.encode("utf-8")) + 256
+            reservation = self.budget.reserve(upper_input, body["max_tokens"])
         resp = await self._client.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -58,6 +67,8 @@ class OpenAICompatLLM(BaseLLM):
         )
         resp.raise_for_status()
         data = resp.json()
+        if reservation is not None:
+            self.budget.settle(reservation, data.get("usage"))
         return data["choices"][0]["message"]["content"] or ""
 
     async def aclose(self) -> None:
@@ -116,8 +127,9 @@ class FakeLLM(BaseLLM):
             "total": 7.7, "verdict": "keep", "reason": "有完整推理链"}, ensure_ascii=False)
 
     def _role_auditor(self, system: str, user: str) -> str:
-        if "【坏段】" in user:
-            return json.dumps({"verdict": "suspect", "first_bad_step": 2,
+        bad = re.search(r"(?m)^\[(\d+)\][^\n]*【坏段】", user)
+        if bad:
+            return json.dumps({"verdict": "suspect", "first_bad_step": int(bad.group(1)),
                                "error_type": "跳步", "evidence": "标记坏段"},
                               ensure_ascii=False)
         return json.dumps({"verdict": "clean", "first_bad_step": None,
@@ -126,16 +138,11 @@ class FakeLLM(BaseLLM):
     def _role_repairer(self, system: str, user: str) -> str:
         if "不可修复" in user:
             return "UNREPAIRABLE"
-        return "（已修复）补全省略的推导：设中间量并代入原式，逐步计算得证。"
+        segment_text = user.split("待修复段落：", 1)[-1].split("\n后文", 1)[0]
+        return re.sub(r"【坏段】[^。]*(?:。|$)", "", segment_text).strip()
 
     def _role_purifier(self, system: str, user: str) -> str:
-        # 确定性变换：保留前 60% + 提纯标记；若答案句被截掉则补回（模拟真实提纯保结论）
-        thinking = user.split("已审计的思考：", 1)[-1].split("\n直接输出", 1)[0]
-        cut = max(20, int(len(thinking) * 0.6))
-        out = thinking[:cut]
-        if "答案是" in thinking and "答案是" not in out:
-            out += "。" + thinking[thinking.rfind("答案是"):]
-        return out + "\n（已提纯：去除冗余回溯，保留关键推理路径）"
+        return user.split("已审计的思考：", 1)[-1].split("\n直接输出", 1)[0].strip()
 
     def _role_proposer(self, system: str, user: str) -> str:
         return json.dumps({
@@ -145,15 +152,12 @@ class FakeLLM(BaseLLM):
             "category_hint_used": "math"}, ensure_ascii=False)
 
     def _role_solver(self, system: str, user: str) -> str:
-        # 从题面中提取纯算术表达式并真算，保证硬验证可确定性通过
-        expr = re.search(r"[-+*/().\d\s]{3,}[\d)]", user)
-        if expr:
-            try:
-                value = eval(expr.group(0).strip(), {"__builtins__": {}}, {})  # noqa: S307 仅测试假模型
-                return f"先算乘除后算加减：对 {expr.group(0).strip()} 求值。答案是 {value}"
-            except Exception:
-                pass
-        return "思考：按题意逐步推导。答案是 0"
+        from ..core.verifier import deterministic_answer
+        task = user.split("任务：", 1)[-1].splitlines()[0].strip()
+        answer = deterministic_answer(task)
+        if answer is not None:
+            return f"先算括号和乘除，再计算加减，对原式逐项代入并检查运算优先级。答案是 {answer}。"
+        return "INSUFFICIENT"
 
     def _role_meta_learner(self, system: str, user: str) -> str:
         return json.dumps({
@@ -161,9 +165,9 @@ class FakeLLM(BaseLLM):
             "supersede": []}, ensure_ascii=False)
 
     def _role_answer_probe(self, system: str, user: str) -> str:
-        m = re.search(r"已知参照结论[：:](.+?)）", user)
-        ans = m.group(1).strip() if m else "0"
-        return f"答案是 {ans}"
+        from ..core.verifier import deterministic_answer
+        task = user.removeprefix("任务：")
+        return deterministic_answer(task.splitlines()[0]) or "INSUFFICIENT"
 
     def _role_biodata_observer(self, system: str, user: str) -> str:
         text = user.split("用户内容：", 1)[-1]
@@ -191,7 +195,7 @@ class FakeLLM(BaseLLM):
         section = user.split("既定事实列表：", 1)[-1]
         facts = [ln.lstrip("- ").strip() for ln in section.splitlines()
                  if ln.strip().startswith("-")]
-        return json.dumps({"narratives": [f"（叙事）{f}" for f in facts]},
+        return json.dumps({"narratives": facts},
                           ensure_ascii=False)
 
     def _role_explore_mission(self, system: str, user: str) -> str:
@@ -207,15 +211,17 @@ class FakeLLM(BaseLLM):
 
 
 class LLMClient:
-    """门面：按配置构造真/Fake 客户端；chat() 返回纯文本。"""
+    """模型调用边界。"""
 
-    def __init__(self, cfg: dict[str, Any]):
+    def __init__(self, cfg: dict[str, Any], budget: dict[str, Any] | None = None,
+                 budget_path: Path | None = None):
         provider = os.environ.get("RSI_LLM_PROVIDER") or cfg.get("provider", "fake")
         self.provider = provider
+        self.budget = DailyBudget(budget, budget_path) if provider != "fake" and budget is not None else None
         if provider == "fake":
             self._impl: BaseLLM = FakeLLM(cfg)
         elif provider == "openai_compatible":
-            self._impl = OpenAICompatLLM(cfg)
+            self._impl = OpenAICompatLLM(cfg, self.budget)
         else:
             raise ValueError(f"未知 LLM provider: {provider}")
         self.total_chars_in = 0
@@ -223,9 +229,10 @@ class LLMClient:
         self.calls = 0
 
     async def chat(self, system: str, user: str, **kw: Any) -> str:
+        system, user = mask_pii(system), mask_pii(user)
+        out = mask_pii(await self._impl.chat(system, user, **kw))
         self.calls += 1
         self.total_chars_in += len(system) + len(user)
-        out = await self._impl.chat(system, user, **kw)
         self.total_chars_out += len(out)
         return out
 
@@ -234,8 +241,7 @@ class LLMClient:
         return _extract_json_block(out)
 
     def estimated_cost(self, rate_per_1k: float = 0.001) -> float:
-        tokens = (self.total_chars_in + self.total_chars_out) / 1.6
-        return tokens / 1000 * rate_per_1k
+        return self.budget.spent() if self.budget is not None else 0.0
 
     async def aclose(self) -> None:
         if isinstance(self._impl, OpenAICompatLLM):

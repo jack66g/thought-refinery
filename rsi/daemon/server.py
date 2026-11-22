@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..connectors.adapters import normalize
+from ..core.cleaner import redact
+from ..core.roles import CATEGORIES
 from .engine import RSIDaemon
 
 
@@ -22,25 +24,27 @@ class DistillBody(BaseModel):
     thinking: str
     conclusion: str = ""
     source: str = "mcp"
+    event_id: str | None = None
+    session_id: str | None = None
 
 
 class SetBudgetBody(BaseModel):
-    daily_cost_cap: float | None = None
+    daily_cost_cap: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     self_propose_enabled: bool | None = None
     self_explore_enabled: bool | None = None
     biodata_enabled: bool | None = None
 
 
 def create_app(daemon: RSIDaemon) -> FastAPI:
-    app = FastAPI(title="RSI daemon", version="0.1.0")
-
-    @app.on_event("startup")
-    async def _startup() -> None:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
         await daemon.start()
+        try:
+            yield
+        finally:
+            await daemon.stop()
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        await daemon.stop()
+    app = FastAPI(title="RSI daemon", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -65,7 +69,8 @@ def create_app(daemon: RSIDaemon) -> FastAPI:
             raise HTTPException(status_code=400, detail="task/thinking 不能为空")
         from ..core.pipeline import new_event
         event = new_event(body.source, body.task, body.thinking, body.conclusion,
-                          event_kind="host_task")
+                          event_kind="host_task", source_event_id=body.event_id,
+                          session_id=body.session_id)
         ok = await daemon.enqueue(event)
         if not ok:
             raise HTTPException(status_code=429, detail="队列已满")
@@ -77,8 +82,10 @@ def create_app(daemon: RSIDaemon) -> FastAPI:
 
     @app.get("/query")
     async def query(category: str = "", k: int = 3) -> dict[str, Any]:
-        base = Path(__file__).resolve().parent.parent / "dataset"
-        cats = [category] if category else ["math", "chinese", "code", "reasoning", "misc"]
+        if (category and category not in CATEGORIES) or not 1 <= k <= 100:
+            raise HTTPException(status_code=400, detail="分类或记录数无效")
+        base = daemon.pipeline.dataset_dir
+        cats = [category] if category else CATEGORIES
         out: dict[str, Any] = {}
         for cat in cats:
             path = base / cat / "sft.jsonl"
@@ -86,7 +93,7 @@ def create_app(daemon: RSIDaemon) -> FastAPI:
                 out[cat] = []
                 continue
             lines = path.read_text(encoding="utf-8").splitlines()
-            out[cat] = [json.loads(x) for x in lines[-k:]]
+            out[cat] = [redact(json.loads(x)) for x in lines[-k:]]
         return out
 
     @app.get("/lessons")
@@ -102,6 +109,7 @@ def create_app(daemon: RSIDaemon) -> FastAPI:
     async def set_budget(body: SetBudgetBody) -> dict[str, Any]:
         if body.daily_cost_cap is not None:
             daemon.cfg.setdefault("budget", {})["daily_cost_cap"] = body.daily_cost_cap
+            daemon.journal.release_budget_wait()
         if body.self_propose_enabled is not None:
             daemon.cfg.setdefault("self_propose", {})["enabled"] = body.self_propose_enabled
         if body.self_explore_enabled is not None:
@@ -110,8 +118,7 @@ def create_app(daemon: RSIDaemon) -> FastAPI:
             daemon.cfg.setdefault("biodata", {})["enabled"] = body.biodata_enabled
             if body.biodata_enabled and daemon.splitter is None:
                 from ..core.splitter import Splitter
-                from .engine import RSI_BASE
-                daemon.splitter = Splitter(daemon.llm, daemon.biodata, daemon.sme, RSI_BASE)
+                daemon.splitter = Splitter(daemon.llm, daemon.biodata, daemon.sme, daemon.base)
             elif not body.biodata_enabled:
                 daemon.splitter = None
         return {"ok": True, "cfg": {"budget": daemon.cfg.get("budget"),

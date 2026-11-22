@@ -5,6 +5,7 @@ import json
 import pytest
 
 from rsi.biodata.state import BioData
+from rsi.core import roles
 from rsi.core.splitter import Splitter, build_style_samples
 from rsi.llm.client import LLMClient
 from rsi.sme_wrap.client import SMEClient
@@ -82,6 +83,25 @@ def test_splitter_dedup_second_event(tmp_path):
     asyncio.run(s.process(_event()))
     out2 = asyncio.run(s.process(_event()))
     assert out2["narratives"] == 0 and out2["transcripts"] == 0
+
+
+def test_supported_narrative_and_identical_transcript_both_retained(tmp_path, monkeypatch):
+    splitter, base = _make_splitter(tmp_path)
+    quotation = "我上周整理好一套虚构模型展板和说明卡片，周日把它们收到蓝色纸盒里，方便下次接着用"
+
+    async def observe(*args):
+        return {"facts": [quotation, "我实际说过的是不存在的第三方话语"]}
+
+    async def narrate(*args):
+        return {"narratives": [quotation, quotation + "。我还给朋友付了一万元。"]}
+
+    monkeypatch.setattr(roles, "observe", observe)
+    monkeypatch.setattr(roles, "narrate", narrate)
+    event = _event()
+    event["transcript"] = [{"role": "user", "content": quotation}]
+    output = asyncio.run(splitter.process(event))
+    assert output["facts"] == 1 and output["narratives"] == 1 and output["transcripts"] == 1
+    assert "一万元" not in (base / "dataset/pretrain/narratives.jsonl").read_text(encoding="utf-8")
 
 
 def test_self_event_skipped(tmp_path):

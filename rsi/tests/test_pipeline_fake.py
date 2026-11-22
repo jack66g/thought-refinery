@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+from rsi.core import roles
 from rsi.core.pipeline import Pipeline, new_event
 from rsi.llm.client import LLMClient
 from rsi.sme_wrap.client import SMEClient
@@ -149,17 +150,43 @@ def test_unrepairable_goes_dpo_negative(pipeline):
 
 def test_repairable_then_accepted(pipeline):
     pipe, tmp = pipeline
-    thinking = ("第一步建立坐标系并设出关键点的坐标参数，写出距离公式。"
-                "第二步代入已知条件化简表达式，得到关于x的一元二次方程。"
-                "【坏段】此处跳步直接给了中间结果，没有展开推导过程，需要补全。"
-                "第三步解方程并取符合几何意义的正根。所以答案是 8。")
-    ev = new_event("zcode", "解析几何求距离", thinking, conclusion="8")
+    thinking = ("先计算括号中的加法，两个二相加得到四，括号外的乘数是二。"
+                "【坏段】这句没有提供有效的运算。"
+                "再用括号内得到的四乘以二，结果是八；用八除以二可验回得到四。答案是 8。")
+    ev = new_event("zcode", "计算 (2+2)*2 的值", thinking, conclusion="8")
     result = _run(pipe, ev)
     assert result["outcome"] == "accepted", result
     assert any(s.startswith("repair=ok") for s in result["stages"])
     sft = (tmp / "dataset" / "math" / "sft.jsonl").read_text(encoding="utf-8")
     rec = json.loads(sft.splitlines()[-1])
     assert rec["meta"]["lineage"] == "repaired"
+
+
+def test_reaudit_failure_prevents_positive_and_lema(pipeline, monkeypatch):
+    pipe, tmp = pipeline
+    calls = []
+
+    async def repeated_suspect(*args):
+        calls.append(1)
+        return {"verdict": "suspect", "first_bad_step": 1, "error_type": "跳步"}
+
+    monkeypatch.setattr(roles, "audit", repeated_suspect)
+    event = new_event("zcode", "计算 (3+5)*2 的值", GOOD_THINKING, conclusion="16")
+    result = _run(pipe, event)
+    assert len(calls) == 2
+    assert result["drop_reason"] == "reaudit_failed:跳步"
+    assert not (tmp / "dataset/math/sft.jsonl").exists()
+    assert not (tmp / "dataset/math/lema.jsonl").exists()
+
+
+def test_replay_uses_same_published_sft_id(pipeline):
+    pipe, tmp = pipeline
+    event = new_event("zcode", "计算 (3+5)*2 的值", GOOD_THINKING, conclusion="16")
+    first = _run(pipe, event)
+    replay = _run(pipe, {**event, "replaying": True})
+    assert first["doc_ids"] == replay["doc_ids"] and replay["outcome"] == "accepted"
+    assert len((tmp / "dataset/math/sft.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    assert len((tmp / "logs/sme_backlog.jsonl").read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_short_thinking_health_drop(pipeline):

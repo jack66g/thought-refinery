@@ -90,6 +90,7 @@ class DedupConfig:
     skeleton_keep_k: int = 2                # 同解答骨架每类保留条数
     max_grams_per_doc: int = 2000
     max_shingles_per_doc: int = 4096
+    global_exact: bool = True
 
 
 @dataclass
@@ -161,8 +162,10 @@ class DedupIndex:
             sha, skel, shingles, grams, _ = self._texts(text)
             cat = self._cat(category)  # 先加载类目（顺带注册 global_shas），再做 L1
             # L1 精确（全局）
-            if sha in self.global_shas and self.global_shas[sha] != doc_id:
-                return DedupVerdict("exact_dup", self.global_shas[sha], 1.0, "L1")
+            duplicate = (self.global_shas.get(sha) if self.cfg.global_exact else
+                         next((key for key, record in cat.items() if key != doc_id and record.sha == sha), None))
+            if duplicate is not None and duplicate != doc_id:
+                return DedupVerdict("exact_dup", duplicate, 1.0, "L1")
             # EQ 骨架等价类（同解答模板，跨题面）
             same_skel = [i for i in self.skeletons[category].get(skel, []) if i != doc_id]
             if len(same_skel) >= self.cfg.skeleton_keep_k:
@@ -207,9 +210,11 @@ class DedupIndex:
     def add(self, text: str, category: str, doc_id: str,
             count_skeleton: bool = True) -> None:
         with self._lock:
+            cat = self._cat(category)
+            if doc_id in cat:
+                return
             sha, skel, shingles, grams, sh_hashes = self._texts(text)
             sig = minhash_signature(shingles, self.cfg.minhash_perms)
-            cat = self._cat(category)
             cat[doc_id] = DedupRecord(doc_id, sha, skel, sig, set(sh_hashes), grams)
             self.global_shas[sha] = doc_id
             if count_skeleton:
