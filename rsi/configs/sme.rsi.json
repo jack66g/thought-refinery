@@ -1,0 +1,66 @@
+{
+  "seed": 42,
+  "llm": {
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "temperature": 0.3,
+    "max_tokens": 1024,
+    "reasoning_effort": "none"
+  },
+  "embedding": {
+    "provider": "hashing"
+  },
+  "policy": {
+    "decay_enabled": false
+  },
+  "extraction": {
+    "enabled": true,
+    "mode": "rules",
+    "store_assistant": false
+  },
+  "factversion": {
+    "enabled": true
+  },
+  "noise": {
+    "enabled": true
+  },
+  "qapair": {
+    "enabled": true,
+    "max_age_days": 365
+  },
+  "factgraph": {
+    "enabled": false
+  },
+  "profile": {
+    "enabled": true,
+    "snapshot_every": 100
+  },
+  "namespaces": {
+    "enabled": true,
+    "default_ns": "cls.misc"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "persistence": {
+    "enabled": true,
+    "checkpoint_every": 200
+  },
+  "maintenance": {
+    "background": true,
+    "idle_after_s": 180,
+    "every_s": 600
+  },
+  "storage": {
+    "path": "data/rsi_memory/engine.json.gz",
+    "autosave": true,
+    "compress": true,
+    "backend": "json"
+  },
+  "api": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "auth_token": ""
+  }
+}

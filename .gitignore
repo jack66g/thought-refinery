@@ -1,0 +1,25 @@
+# ===== 不上传：SME 源码（独立仓库，另行获取） =====
+spatial-memory-engine/
+
+# ===== 运行环境 =====
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# ===== 个人数据（绝不入库） =====
+data/
+rsi/biodata/*.json
+rsi/biodata/*.jsonl
+rsi/logs/
+rsi/dataset/*/
+rsi/dataset/**/*.jsonl
+rsi/dataset/**/*.json
+
+# ===== 内部工程台账 =====
+docs/03_工作台账.md
+
+# ===== 杂项 =====
+*.log
+.DS_Store
+Thumbs.db
