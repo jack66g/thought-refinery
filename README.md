@@ -105,4 +105,4 @@ Big Five/PAD/ALMA 分层情感模型、稳态 RL 需求动力学。
 
 ## License
 
-MIT © 2026 jack66g
+Apache-2.0 © 2026 jack66g（与记忆后端 SME 同协议）
