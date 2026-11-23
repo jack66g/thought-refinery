@@ -169,6 +169,28 @@ class FakeLLM(BaseLLM):
         task = user.removeprefix("任务：")
         return deterministic_answer(task.splitlines()[0]) or "INSUFFICIENT"
 
+    def _role_choice_scene(self, system: str, user: str) -> str:
+        inputs = json.loads(user)
+        label = inputs["context"]
+        return json.dumps({
+            "title": "周末工作坊",
+            "background": f"在一段虚构的{label}故事中，你和朋友要准备一场小型工作坊。"
+                          "剩下一个下午，可以选一种推进方式；三种做法都来得及完成。",
+            "question": "接下来你会怎么做？",
+            "a": f"优先采用{inputs['side_a']}的方式推进，留出相同的复盘时间。",
+            "b": f"优先采用{inputs['side_b']}的方式推进，留出相同的复盘时间。",
+            "mixed": "把下午分为两段，先并行准备两种方案，再根据现场状况切换。",
+            "memory_refs": [1],
+        }, ensure_ascii=False)
+
+    def _role_choice_reasons(self, system: str, user: str) -> str:
+        return json.dumps({
+            "question": "哪一个因素最影响你刚才的决定？",
+            "r1": "这能更快让我掌握现场反馈，方便随后调整。",
+            "r2": "我希望先明确每个人的时间和责任，便于协调。",
+            "r3": "我更看重回撤空间，遇到变化也能恢复原计划。",
+        }, ensure_ascii=False)
+
     def _role_biodata_observer(self, system: str, user: str) -> str:
         text = user.split("用户内容：", 1)[-1]
         mood = {"p": 0.0, "a": 0.0, "d": 0.0}

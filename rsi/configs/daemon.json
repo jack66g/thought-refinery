@@ -60,6 +60,13 @@
     "enabled": false,
     "max_missions_per_day": 5
   },
+  "choice_mode": {
+    "enabled": false,
+    "open_browser": true,
+    "rounds_per_day": 3,
+    "min_profile_updates": 12,
+    "min_memories": 6
+  },
   "budget": {
     "daily_cost_cap": 5.0,
     "input_usd_per_million": 0.30,

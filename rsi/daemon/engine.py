@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..biodata.state import load_biodata
+from ..choice import ChoiceMode
 from ..core import roles
 from ..core.cleaner import mask_pii
 from ..core.pipeline import Pipeline, new_event
@@ -40,6 +41,7 @@ class RSIDaemon:
         self.splitter = (Splitter(self.llm, self.biodata, self.sme, base)
                          if cfg.get("biodata", {}).get("enabled", True) else None)
         self.explorer = Explorer(self.llm, self.biodata, self.sme, cfg, base)
+        self.choice_mode = ChoiceMode(cfg.get("choice_mode", {}), base, self.biodata, self.llm, self.sme)
         self.journal = EventJournal(base / "logs" / "events.sqlite3",
                                     int(cfg.get("queue", {}).get("max_len", 2000)))
         self._ready = asyncio.Event()
@@ -71,6 +73,7 @@ class RSIDaemon:
         await self.llm.aclose()
         await self.sme.aclose()
         self.journal.close()
+        self.choice_mode.close()
 
     # ---------- 入队 ----------
 

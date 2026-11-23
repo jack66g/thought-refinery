@@ -1,13 +1,16 @@
 """RSI daemon HTTP 面：/ingest（宿主投喂）/distill/status/query/lessons/set_budget。"""
 from __future__ import annotations
 
+import asyncio
 import json
-from contextlib import asynccontextmanager
+from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from ..choice.routes import choice_router
 from ..connectors.adapters import normalize
 from ..core.cleaner import redact
 from ..core.roles import CATEGORIES
@@ -35,16 +38,26 @@ class SetBudgetBody(BaseModel):
     biodata_enabled: bool | None = None
 
 
-def create_app(daemon: RSIDaemon) -> FastAPI:
+def create_app(daemon: RSIDaemon, show_choice: Callable[[], None] | None = None) -> FastAPI:
+    async def open_page() -> None:
+        await asyncio.sleep(0.6)
+        await asyncio.to_thread(show_choice)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await daemon.start()
+        popup = asyncio.create_task(open_page()) if show_choice and daemon.choice_mode.enabled else None
         try:
             yield
         finally:
+            if popup is not None:
+                popup.cancel()
+                with suppress(asyncio.CancelledError):
+                    await popup
             await daemon.stop()
 
     app = FastAPI(title="RSI daemon", version="0.1.0", lifespan=lifespan)
+    app.include_router(choice_router(daemon.choice_mode, show_choice))
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

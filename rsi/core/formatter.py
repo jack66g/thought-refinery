@@ -143,6 +143,12 @@ class Formatter:
                 {"id": doc_id, "text": text, "meta": meta})
         return doc_id
 
+    def write_personality_choice(self, messages: list[dict[str, str]], meta: dict[str, Any]) -> str:
+        doc_id = self._id("personality-choice", messages, meta)
+        self._persist(self.dataset_dir / "style" / "choices.jsonl",
+                      {"id": doc_id, "messages": messages, "meta": meta})
+        return doc_id
+
     def write_style(self, messages: list[dict[str, str]], meta: dict[str, Any]) -> str:
         """风格SFT：assistant=用户原话（模型学做用户）。"""
         doc_id = self._id("style", messages, meta)
@@ -162,7 +168,7 @@ PRETRAIN_RECIPE = {
 }
 
 
-PRETRAIN_KINDS = ("transcripts", "narratives", "rewrites")
+PRETRAIN_KINDS = ("transcripts", "narratives", "rewrites", "choices")
 MOODS = ("positive", "negative", "neutral")
 
 
@@ -221,6 +227,9 @@ def build_pretrain_manifest(dataset_dir: Path) -> dict[str, Any]:
             counts = manifest[field]
             counts[key] = counts.get(key, 0) + 1
     manifest["lines"]["style_sft"] = {"count": len(_rows(dataset_dir / "style" / "sft.jsonl"))}
+    choices = dataset_dir / "style" / "choices.jsonl"
+    if choices.exists():
+        manifest["lines"]["personality_choice_sft"] = {"count": len(_rows(choices))}
     manifest["total_pretrain"] = len(all_rows)
     sampled = _balanced(all_rows, 100)
     buckets = {mood: sum(_mood(row) == mood for row in sampled) for mood in MOODS}

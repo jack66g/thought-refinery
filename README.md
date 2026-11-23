@@ -73,6 +73,12 @@ rsi\start_rsi.bat        # Windows；Linux 手动跑两个 python -m 进程
 python -m pytest rsi/tests -q    # 66 项，包含 FakeLLM 数据流和 MCP stdio
 ```
 
+## 情境选择
+
+RSI 启动后，从 [情境选择页](http://127.0.0.1:8100/choice) 打开选择模式。也可以在 `rsi/configs/daemon.json` 中设置 `choice_mode.enabled` 为 `true`，随 daemon 启动打开答题窗口。
+
+默认每天三轮。每轮选择做法、理由各一次，完成后各生成一条人格预训练和人格后训练记录。出题需要至少 12 次画像更新和 6 条去重的个人记忆。计分和数据来源见 [设计文档](docs/设计文档.md#情境选择模式)。
+
 ## 独立运行与数据快照
 
 守护进程可用 `--data-dir` 指定运行数据目录，便于在临时目录内验证新配置及数据质量。冻结导出将 CoT、预训练和风格记录按质量契约与血缘生成快照。

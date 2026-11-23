@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import webbrowser
 from pathlib import Path
 
 import uvicorn
@@ -30,9 +32,21 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(Path(args.config))
     daemon = RSIDaemon(cfg, args.data_dir.resolve())
-    app = create_app(daemon)
-    uvicorn.run(app, host=cfg.get("daemon", {}).get("host", "127.0.0.1"),
-                port=int(cfg.get("daemon", {}).get("port", 8100)), log_level="info")
+    host = cfg.get("daemon", {}).get("host", "127.0.0.1")
+    port = int(cfg.get("daemon", {}).get("port", 8100))
+    address = "[::1]" if host in ("::1", "::") else "127.0.0.1"
+
+    def show_choice() -> None:
+        url = f"http://{address}:{port}/choice"
+        try:
+            opened = webbrowser.open(url, new=2)
+        except (webbrowser.Error, OSError):
+            opened = False
+        if not opened:
+            logging.getLogger(__name__).info("可打开情境选择页面 %s", url)
+
+    popup = show_choice if cfg.get("choice_mode", {}).get("open_browser", True) else None
+    uvicorn.run(create_app(daemon, popup), host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

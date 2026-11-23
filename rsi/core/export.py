@@ -41,6 +41,11 @@ def _eligible(product: str, row: dict[str, Any]) -> bool:
                 and isinstance(row.get("chosen"), str) and bool(_COT.fullmatch(row["chosen"]))
                 and isinstance(row.get("rejected"), str) and row["chosen"] != row["rejected"])
     target = _target(row.get("messages"))
+    if product == "personality_choice":
+        return (target == 3 and row["messages"][0]["role"] == "user"
+                and row["messages"][1]["role"] == "assistant" and row["messages"][2]["role"] == "user"
+                and meta.get("synthetic_scenario") is True
+                and meta.get("target_source") == "confirmed_model_option")
     return target is not None and (
         product == "style" or bool(_COT.fullmatch(row["messages"][target]["content"])))
 
@@ -81,18 +86,26 @@ def freeze(source: Path, destination: Path, validation_percent: int = 20,
         raise ValueError("validation_percent 必须在 0 到 99 之间")
     if destination.exists():
         raise FileExistsError(destination)
-    paths = [("style", source / "style" / "sft.jsonl")]
+    paths = [("style", source / "style" / "sft.jsonl"),
+             ("personality_choice", source / "style" / "choices.jsonl")]
     paths.extend((product, source / category / f"{name}.jsonl")
                  for category in CATEGORIES for product, name in (("cot", "sft"), ("lema", "lema"), ("dpo", "dpo")))
     # 先从通过质量版本门的 CPT 记录分层取样，旧版记录不占用配额。
     cpt = [row for kind in PRETRAIN_KINDS for row in _rows(source / "pretrain" / f"{kind}.jsonl")]
     proposed = [(product, row) for product, path in paths for row in _rows(path)]
+    cpt_choice_ids = {row["meta"]["event_id"] for row in cpt
+                      if _eligible("pretrain", row) and row["meta"].get("source") == "choice_mode"}
+    sft_choice_ids = {row["meta"]["event_id"] for product, row in proposed
+                      if product == "personality_choice" and _eligible(product, row)}
+    complete_choices = cpt_choice_ids & sft_choice_ids
     unique_cpt = {}
     for row in cpt:
-        if _eligible("pretrain", row):
+        if (_eligible("pretrain", row) and (row["meta"].get("source") != "choice_mode"
+                                           or row["meta"]["event_id"] in complete_choices)):
             unique_cpt.setdefault(normalize_text(row["text"]), row)
     selected = _balanced(list(unique_cpt.values()), per_bucket_cap)
-    rows = [(product, redact(row)) for product, row in proposed if _eligible(product, row)]
+    rows = [(product, redact(row)) for product, row in proposed if _eligible(product, row)
+            and (product != "personality_choice" or row["meta"]["event_id"] in complete_choices)]
     rows.extend(("pretrain", redact(row)) for row in selected)
     groups = _groups(rows)
     files: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -103,6 +116,8 @@ def freeze(source: Path, destination: Path, validation_percent: int = 20,
         row["meta"]["split_group"] = hashlib.sha256(group.encode()).hexdigest()[:16]
         if product in ("cot", "lema", "style"):
             row["meta"]["train_message_indices"] = [_target(row["messages"])]
+        elif product == "personality_choice":
+            row["meta"]["train_message_indices"] = [1, 3]
         files.setdefault((split, product), []).append(row)
     manifest = {
         "schema_version": 2,
@@ -111,6 +126,7 @@ def freeze(source: Path, destination: Path, validation_percent: int = 20,
         - sum(_eligible(product, row) for product, row in proposed)
         - sum(_eligible("pretrain", row) for row in cpt),
         "selected_pretrain_moods": dict(Counter(row["meta"].get("mood", "neutral") for row in selected)),
+        "unpaired_choice_rounds": len(cpt_choice_ids ^ sft_choice_ids),
         "validation_percent": validation_percent,
     }
     destination.parent.mkdir(parents=True, exist_ok=True)

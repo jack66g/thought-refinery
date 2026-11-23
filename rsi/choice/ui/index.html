@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>情境选择 · RSI</title>
+  <link rel="stylesheet" href="/choice/ui/choice.css">
+  <script src="/choice/ui/choice.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <div class="identity"><span class="mark" aria-hidden="true">R</span><span>RSI</span></div>
+      <label class="switch">
+        <input id="enabled" type="checkbox" disabled>
+        <span class="track" aria-hidden="true"></span>
+        <span>选择模式</span>
+      </label>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="intro" aria-labelledby="title">
+      <div class="intro-copy">
+        <h1 id="title">情境选择</h1>
+        <p>进入一个由画像与脱敏记忆生成的虚构情境。选一个做法，再选最贴切的理由。</p>
+        <div class="intro-actions">
+          <button id="open" class="primary" type="button" hidden>进入答题</button>
+          <button id="retry" class="secondary" type="button" hidden>刷新状态</button>
+        </div>
+        <p id="status" class="status" role="status">正在读取状态…</p>
+      </div>
+      <dl class="summary">
+        <div><dt>今日已开启</dt><dd id="quota">—</dd></div>
+        <div><dt>画像更新</dt><dd id="profile-count">—</dd></div>
+        <div><dt>可用记忆</dt><dd id="memory-count">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="profile" aria-labelledby="profile-title">
+      <div class="section-title">
+        <h2 id="profile-title">选择记录</h2>
+        <span id="total"></span>
+      </div>
+      <p id="profile-note">每轮同时记录做法和理由。来自多个情境的选择会逐渐形成个人倾向。</p>
+      <div id="axes" class="axes"></div>
+    </section>
+  </main>
+
+  <dialog id="round" aria-labelledby="scene-title">
+    <div class="dialog-head">
+      <span id="progress" class="progress"></span>
+      <button id="close" class="close" type="button" aria-label="暂时关闭答题窗口">×</button>
+    </div>
+    <section class="dialog-content">
+      <h2 id="scene-title" tabindex="-1"></h2>
+      <p id="background" class="background"></p>
+      <p id="previous" class="previous" hidden></p>
+      <fieldset id="choices" hidden>
+        <legend id="question"></legend>
+        <div id="options"></div>
+      </fieldset>
+      <p id="notice" class="notice" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button id="confirm" class="primary" type="button"></button>
+        <button id="later" class="secondary" type="button" hidden>这轮先略过</button>
+      </div>
+    </section>
+  </dialog>
+</body>
+</html>
